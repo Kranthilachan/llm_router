@@ -45,7 +45,17 @@
     "Show me my timesheet for last week",
     "How much of my leave quota is used",
     "When does my annual leave reset",
-    "Do I have any leaves left this month"
+    "Do I have any leaves left this month",
+    "Summarize this candidate's resume and highlight key risks",
+    "Review this CV for a full-stack developer role",
+    "Screen this resume for a senior software engineer position",
+    "Extract the candidate's skills and experience from this resume",
+    "Evaluate this applicant's qualifications against the job description",
+    "Summarize the work history from this CV in bullet points",
+    "Identify red flags or gaps in this candidate's resume",
+    "Compare these candidate resumes for a data engineer role",
+    "Shortlist candidates from these resumes based on Java experience",
+    "Draft interview questions based on this candidate's resume"
   ],
   "project": [
     "Create a sprint plan with milestones and backlog grooming for the Q3 roadmap",

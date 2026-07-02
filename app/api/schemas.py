@@ -54,6 +54,7 @@ class RouteRequest(BaseModel):
     )
     profile_name: str = "balanced"
     shadow_model: Optional[str] = None
+    execute_answer: bool = False
 
     class Config:
         json_schema_extra = {
@@ -63,6 +64,7 @@ class RouteRequest(BaseModel):
                 "estimated_tokens": 3000,
                 "estimated_output_tokens": 4000,
                 "profile_name": "balanced",
+                "execute_answer": False,
             }
         }
 
@@ -103,6 +105,11 @@ class RouteResponse(BaseModel):
     selected_plan: Optional[ExecutionPlanOut]
     decision_record: Dict[str, Any]
     summary_text: str
+    answer_text: Optional[str] = None
+    execution_status: Optional[str] = None
+    execution_metadata: Optional[Dict[str, Any]] = None
+    execution_warnings: List[str] = Field(default_factory=list)
+    execution_error: Optional[Dict[str, str]] = None
 
 
 class OutcomeIn(BaseModel):

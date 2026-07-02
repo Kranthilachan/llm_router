@@ -11,10 +11,15 @@ Endpoints:
 """
 
 import asyncio
+import json
 from dataclasses import asdict
+import os
+import shutil
+import tempfile
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from app.api.schemas import (
     ExecutionPlanOut,
@@ -37,6 +42,7 @@ from app.config import (
     SCORING_VERSION,
     TELEMETRY_SNAPSHOT_VERSION,
 )
+from app.core.execution import executable_model_names, maybe_execute_routed_answer
 from app.core.formatting import format_decision_summary
 from app.core.llm_domain_parser import hybrid_tiebreaker_parser
 from app.core.router import record_outcome, route
@@ -70,6 +76,31 @@ def _to_tenant_context(tc_in: Optional[TenantContextIn]) -> TenantContext:
     return TenantContext(**tc_in.model_dump())
 
 
+def _apply_execution_constraints(
+    rc: RequestConstraints,
+    tc: TenantContext,
+    *,
+    execute_answer: bool,
+) -> tuple[RequestConstraints, TenantContext]:
+    if not execute_answer:
+        return rc, tc
+
+    executable_models = executable_model_names()
+    executable_providers = ["OpenAI"]
+
+    if rc.allowed_providers is None:
+        rc.allowed_providers = list(executable_providers)
+    else:
+        rc.allowed_providers = [p for p in rc.allowed_providers if p in executable_providers]
+
+    if tc.allowed_models is None:
+        tc.allowed_models = list(executable_models)
+    else:
+        tc.allowed_models = [m for m in tc.allowed_models if m in executable_models]
+
+    return rc, tc
+
+
 def _strip_noise(record: Dict[str, Any]) -> Dict[str, Any]:
     # Trim per-model dumps from the response — callers only need the
     # primary + fallbacks + verifiers, not the full list of rejected or
@@ -89,6 +120,103 @@ def _strip_noise(record: Dict[str, Any]) -> Dict[str, Any]:
             if k not in ("feasibility_exclusions", "policy_exclusions")
         }
     return scrubbed
+
+
+_EXT_TO_INPUT_FORMAT = {
+    ".pdf": "pdf",
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".gif": "image",
+    ".webp": "image",
+    ".mp3": "audio",
+    ".wav": "audio",
+    ".m4a": "audio",
+    ".flac": "audio",
+    ".ogg": "audio",
+    ".aac": "audio",
+    ".txt": "text",
+    ".md": "text",
+}
+
+
+def _normalize_uploaded_input_formats(raw: Optional[str]) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    if not raw.strip():
+        return None
+    parsed = None
+    try:
+        parsed_json = json.loads(raw)
+        if isinstance(parsed_json, list):
+            parsed = parsed_json
+    except json.JSONDecodeError:
+        parsed = None
+    if parsed is None:
+        parsed = raw.replace(";", ",").split(",")
+    normalized = [item.strip().lower() for item in parsed if isinstance(item, str) and item.strip()]
+    return normalized or None
+
+
+def _infer_input_formats_from_uploads(files: Optional[List[UploadFile]]) -> Optional[List[str]]:
+    if not files:
+        return None
+    inferred: List[str] = []
+    seen: set = set()
+    for upload in files:
+        name = upload.filename or ""
+        ext = Path(name).suffix.lower()
+        fmt = _EXT_TO_INPUT_FORMAT.get(ext)
+        if fmt and fmt not in seen:
+            seen.add(fmt)
+            inferred.append(fmt)
+    return inferred or None
+
+
+def _save_uploads(files: Optional[List[UploadFile]]) -> List[str]:
+    if not files:
+        return []
+    saved_files: List[str] = []
+    temp_root = tempfile.mkdtemp(prefix="atlas-route-upload-")
+    try:
+        for upload in files:
+            filename = upload.filename or "upload.bin"
+            safe_name = Path(filename).name
+            suffix = Path(safe_name).suffix
+            fd, out_path = tempfile.mkstemp(suffix=suffix, dir=temp_root)
+            os.close(fd)
+            try:
+                with open(out_path, "wb") as dst:
+                    shutil.copyfileobj(upload.file, dst)
+            finally:
+                upload.file.close()
+            saved_files.append(out_path)
+        return saved_files
+    except Exception:
+        for p in saved_files:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+        except Exception:
+            pass
+        raise
+
+
+def _cleanup_uploads(saved_paths: List[str]) -> None:
+    for path in saved_paths:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+    parent = Path(saved_paths[0]).parent if saved_paths else None
+    if parent is not None:
+        try:
+            shutil.rmtree(parent, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _plan_to_out(plan) -> Optional[ExecutionPlanOut]:
@@ -116,6 +244,14 @@ def _plan_to_out(plan) -> Optional[ExecutionPlanOut]:
 
 @router.post("/route", response_model=RouteResponse)
 async def route_request(payload: RouteRequest) -> RouteResponse:
+    request_constraints = _to_request_constraints(payload.request_constraints)
+    tenant_context = _to_tenant_context(payload.tenant_context)
+    request_constraints, tenant_context = _apply_execution_constraints(
+        request_constraints,
+        tenant_context,
+        execute_answer=payload.execute_answer,
+    )
+
     try:
         async with _registry_lock:
             decision = route(
@@ -124,8 +260,8 @@ async def route_request(payload: RouteRequest) -> RouteResponse:
                 estimated_tokens=payload.estimated_tokens,
                 estimated_output_tokens=payload.estimated_output_tokens,
                 artifact_hints=payload.artifact_hints,
-                request_constraints=_to_request_constraints(payload.request_constraints),
-                tenant_context=_to_tenant_context(payload.tenant_context),
+                request_constraints=request_constraints,
+                tenant_context=tenant_context,
                 files=payload.files,
                 profile_name=payload.profile_name,
                 shadow_model=payload.shadow_model,
@@ -135,13 +271,159 @@ async def route_request(payload: RouteRequest) -> RouteResponse:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    execution = None
+    if payload.execute_answer:
+        execution = maybe_execute_routed_answer(
+            decision=decision,
+            prompt=payload.prompt,
+            input_formats=payload.input_formats,
+            files=payload.files,
+        )
+
     return RouteResponse(
         abstain=decision.abstain,
         escalate_to_human=decision.escalate_to_human,
         selected_plan=_plan_to_out(decision.selected_plan),
         decision_record=_strip_noise(decision.decision_record),
         summary_text=format_decision_summary(decision),
+        answer_text=execution.answer_text if execution else None,
+        execution_status=execution.status if execution else None,
+        execution_metadata=execution.metadata if execution else None,
+        execution_warnings=execution.warnings if execution else [],
+        execution_error=execution.error if execution else None,
     )
+
+
+@router.post("/route/upload", response_model=RouteResponse)
+async def route_upload_request(request: Request) -> RouteResponse:
+    """
+    Accepts either:
+      * multipart/form-data with files + form fields (execute_answer defaults to True)
+      * application/json body identical to /route (execute_answer also defaults to True here)
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    # JSON path — same schema as /route, but execute_answer defaults to True.
+    if "application/json" in content_type:
+        try:
+            payload_dict = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+        if not isinstance(payload_dict, dict):
+            raise HTTPException(status_code=422, detail="JSON body must be an object.")
+        payload_dict.setdefault("execute_answer", True)
+        try:
+            payload = RouteRequest(**payload_dict)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid request body: {exc}") from exc
+        return await route_request(payload)
+
+    # Multipart form-data path.
+    form = await request.form()
+    prompt_raw = form.get("prompt")
+    prompt = str(prompt_raw).strip() if prompt_raw is not None else ""
+    files = [f for f in form.getlist("files") if isinstance(f, UploadFile)]
+    input_formats_raw = form.get("input_formats")
+    input_formats = str(input_formats_raw) if input_formats_raw is not None else None
+
+    def _form_int(name: str, default: int) -> int:
+        raw = form.get(name)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return default
+        try:
+            return int(str(raw))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"'{name}' must be an integer.") from exc
+
+    def _form_bool(name: str, default: bool) -> bool:
+        raw = form.get(name)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return default
+        return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+    estimated_tokens = _form_int("estimated_tokens", 2000)
+    estimated_output_tokens = _form_int("estimated_output_tokens", 1200)
+    artifact_hints_raw = form.get("artifact_hints")
+    artifact_hints = str(artifact_hints_raw) if artifact_hints_raw is not None else None
+    profile_name = str(form.get("profile_name") or "balanced")
+    shadow_model_raw = form.get("shadow_model")
+    shadow_model = str(shadow_model_raw) if shadow_model_raw is not None else None
+    execute_answer = _form_bool("execute_answer", True)
+
+    if not prompt and not files:
+        raise HTTPException(status_code=422, detail="At least one of prompt text or files is required.")
+
+    normalized_input_formats = _normalize_uploaded_input_formats(input_formats)
+    if normalized_input_formats is None:
+        normalized_input_formats = _infer_input_formats_from_uploads(files)
+    parsed_artifact_hints = None
+    if artifact_hints:
+        try:
+            parsed = json.loads(artifact_hints)
+            if not isinstance(parsed, list):
+                raise ValueError
+            parsed_artifact_hints = parsed
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid artifact_hints JSON. Provide a JSON array, e.g. [{\"format\":\"pdf\",\"page_count\":12}]",
+            ) from exc
+
+    saved_files = []
+    try:
+        saved_files = _save_uploads(files)
+
+        request_constraints = _to_request_constraints(None)
+        tenant_context = _to_tenant_context(None)
+        request_constraints, tenant_context = _apply_execution_constraints(
+            request_constraints,
+            tenant_context,
+            execute_answer=execute_answer,
+        )
+
+        try:
+            async with _registry_lock:
+                decision = route(
+                    prompt=prompt,
+                    input_formats=normalized_input_formats,
+                    estimated_tokens=estimated_tokens,
+                    estimated_output_tokens=estimated_output_tokens,
+                    artifact_hints=parsed_artifact_hints,
+                    request_constraints=request_constraints,
+                    tenant_context=tenant_context,
+                    files=saved_files,
+                    profile_name=profile_name,
+                    shadow_model=shadow_model,
+                    registry=MODEL_REGISTRY,
+                    llm_parser=hybrid_tiebreaker_parser if LLM_PARSER_ENABLED else None,
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        execution = None
+        if execute_answer:
+            execution = maybe_execute_routed_answer(
+                decision=decision,
+                prompt=prompt,
+                input_formats=normalized_input_formats,
+                files=saved_files,
+            )
+
+        return RouteResponse(
+            abstain=decision.abstain,
+            escalate_to_human=decision.escalate_to_human,
+            selected_plan=_plan_to_out(decision.selected_plan),
+            decision_record=_strip_noise(decision.decision_record),
+            summary_text=format_decision_summary(decision),
+            answer_text=execution.answer_text if execution else None,
+            execution_status=execution.status if execution else None,
+            execution_metadata=execution.metadata if execution else None,
+            execution_warnings=execution.warnings if execution else [],
+            execution_error=execution.error if execution else None,
+        )
+    finally:
+        if saved_files:
+            _cleanup_uploads(saved_files)
 
 
 @router.post("/outcome", status_code=204)
