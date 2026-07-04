@@ -7,10 +7,11 @@ def format_decision_summary(decision: RoutingDecision) -> str:
     lines = []
     rec = decision.decision_record
     lines.append("=== Atlas Router Decision ===")
-    lines.append(f"Decision ID: {rec['decision_id']}")
-    lines.append(f"Status: {rec['status'].upper()}")
-    lines.append(f"Timestamp: {rec['timestamp_utc']}")
-    lines.append(f"Routing latency: {rec['elapsed_ms']:.1f} ms")
+    lines.append(f"Decision ID: {rec.get('decision_id', 'N/A')}")
+    lines.append(f"Status: {rec.get('status', 'N/A').upper()}")
+    lines.append(f"Timestamp: {rec.get('timestamp_utc', 'N/A')}")
+    elapsed = rec.get('elapsed_ms')
+    lines.append(f"Routing latency: {f'{elapsed:.1f} ms' if elapsed is not None else 'N/A'}")
     lines.append("")
 
     ts = rec.get("task_summary", {})

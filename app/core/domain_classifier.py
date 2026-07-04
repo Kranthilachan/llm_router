@@ -39,7 +39,7 @@ DATASET_PATH = Path(__file__).resolve().parents[2] / "data" / "domain_examples.j
 # Minimum cosine similarity required for the embedding classifier to win.
 # Below this the parser either falls through to keyword heuristics OR
 # escalates to the LLM tiebreaker (when llm_parser is wired in route()).
-LEARNED_DOMAIN_CONFIDENCE_THRESHOLD = 0.55
+LEARNED_DOMAIN_CONFIDENCE_THRESHOLD = 0.70
 
 RISK_METADATA: Dict[str, Tuple[str, str, str]] = {
     "crm": ("low", "standard", "crm_record"),

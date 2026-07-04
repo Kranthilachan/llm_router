@@ -78,7 +78,7 @@ def test_route_execute_answer_returns_completion(monkeypatch):
     monkeypatch.setattr("app.api.routes.route", lambda **_: _decision(selected_model="o3"))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
-    def _fake_call_openai(*, api_model: str, prompt: str):
+    def _fake_call_openai(*, api_model: str, prompt: str, **kwargs):
         assert api_model == "o3"
         assert prompt == "Write a haiku."
         return "calm sea at sunrise", {"total_tokens": 12}, "stop"
@@ -138,7 +138,7 @@ def test_route_execute_answer_rejects_non_text_requests(monkeypatch):
 
     assert response.status_code == 200
     assert data["execution_status"] == "unsupported"
-    assert "text-only" in data["execution_warnings"][0]
+    assert "non-text" in data["execution_warnings"][0]
 
 
 def test_route_execute_answer_applies_executable_model_constraints(monkeypatch):
