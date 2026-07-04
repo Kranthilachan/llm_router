@@ -34,7 +34,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DATASET_PATH = Path(__file__).resolve().parents[2] / "data" / "domain_examples.json"
+from app.db.connection import get_connection
+from app.config import ATLAS_DB_PATH
+
+DATASET_PATH = Path(__file__).resolve().parents[2] / ATLAS_DB_PATH
 
 # Minimum cosine similarity required for the embedding classifier to win.
 # Below this the parser either falls through to keyword heuristics OR
@@ -56,18 +59,34 @@ _labels: List[str] = []
 
 def _load_dataset(path: Path) -> Optional[Dict[str, List[str]]]:
     if not path.exists():
-        logger.warning("Domain dataset not found at %s; classifier disabled.", path)
+        logger.warning("Database not found at %s; classifier disabled.", path)
         return None
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Failed to load domain dataset at %s: %s", path, exc)
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT d.name, e.example_text 
+            FROM domain_examples e 
+            JOIN domains d ON e.domain_id = d.id
+        ''')
+        rows = cursor.fetchall()
+        conn.close()
+        
+        data = {}
+        for row in rows:
+            domain = row['name']
+            text = row['example_text']
+            if domain not in data:
+                data[domain] = []
+            data[domain].append(text)
+            
+        if not data:
+            logger.warning("No domain examples found in database %s.", path)
+            return None
+        return data
+    except Exception as exc:
+        logger.warning("Failed to load domain dataset from %s: %s", path, exc)
         return None
-    if not isinstance(data, dict) or not data:
-        logger.warning("Domain dataset at %s is empty or malformed.", path)
-        return None
-    return {label: prompts for label, prompts in data.items() if prompts}
 
 
 def _load_model():

@@ -19,13 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.models.schemas import RoutingDecision
 
-# Router model names are synthetic in this repo. Only explicitly mapped names
-# are executable through the real provider adapter.
-OPENAI_MODEL_MAP = {
-    "o3": "o3",
-    "GPT-4o": "gpt-4o",
-    "GPT-4o-Mini": "gpt-4o-mini",
-}
+# Router model names are converted to lowercase to match OpenAI's API format.
 
 _EXECUTABLE_TEXT_EXTENSIONS = {".txt", ".md"}
 _SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac"}
@@ -69,7 +63,12 @@ class ExecutionResult:
 
 def executable_model_names() -> List[str]:
     """Return the routed model names that can be executed in this deployment."""
-    return sorted(OPENAI_MODEL_MAP)
+    try:
+        from app.db.registry_repo import load_registry
+        registry = load_registry()
+        return [m["name"] for m in registry if m.get("provider", "").lower() in ("openai", "anthropic", "meta")]
+    except Exception:
+        return []
 
 
 def maybe_execute_routed_answer(
@@ -108,16 +107,41 @@ def maybe_execute_routed_answer(
         )
 
     selected_model = plan.selected_model
-    api_model = OPENAI_MODEL_MAP.get(selected_model or "")
-    if not api_model:
+    if not selected_model:
         return ExecutionResult(
             status="unsupported",
-            warnings=[f"Routed model '{selected_model}' is not mapped to an executable provider model."],
+            warnings=["Routed model name is missing."],
         )
-    if not os.getenv("OPENAI_API_KEY"):
+    
+    # Simple adapter: assume API model ID is the lowercase version of the internal name
+    api_model = selected_model.lower()
+    
+    # Lookup provider
+    provider = "OpenAI"
+    try:
+        from app.db.registry_repo import load_registry
+        registry = load_registry()
+        for m in registry:
+            if m["name"] == selected_model:
+                provider = m.get("provider", "OpenAI")
+                break
+    except Exception:
+        pass
+
+    if provider.lower() == "openai" and not os.getenv("OPENAI_API_KEY"):
         return ExecutionResult(
             status="failed",
-            error={"code": "missing_openai_api_key", "message": "OPENAI_API_KEY is required for execution."},
+            error={"code": "missing_api_key", "message": "OPENAI_API_KEY is required for execution."},
+        )
+    if provider.lower() == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
+        return ExecutionResult(
+            status="failed",
+            error={"code": "missing_api_key", "message": "ANTHROPIC_API_KEY is required for execution."},
+        )
+    if provider.lower() == "meta" and not (os.getenv("META_API_KEY") or os.getenv("TOGETHER_API_KEY")):
+        return ExecutionResult(
+            status="failed",
+            error={"code": "missing_api_key", "message": "META_API_KEY or TOGETHER_API_KEY is required for execution."},
         )
 
     normalized_formats = [fmt.lower() for fmt in (input_formats or ["text"])]
@@ -174,6 +198,7 @@ def maybe_execute_routed_answer(
         try:
             answer_text, usage, finish_reason, mr_warnings, mr_stats = _execute_map_reduce(
                 api_model=api_model,
+                provider=provider,
                 user_prompt=prompt,
                 combined_text=combined_text,
                 file_images=file_images or None,
@@ -206,11 +231,24 @@ def maybe_execute_routed_answer(
         if file_paths:
             execution_prompt = _compose_execution_prompt(prompt=prompt, file_context=file_context)
         try:
-            answer_text, usage, finish_reason = _call_openai(
-                api_model=api_model,
-                prompt=execution_prompt,
-                images=file_images or None,
-            )
+            if provider.lower() == "anthropic":
+                answer_text, usage, finish_reason = _call_anthropic(
+                    api_model=api_model,
+                    prompt=execution_prompt,
+                    images=file_images or None,
+                )
+            elif provider.lower() == "meta":
+                answer_text, usage, finish_reason = _call_meta(
+                    api_model=api_model,
+                    prompt=execution_prompt,
+                    images=file_images or None,
+                )
+            else:
+                answer_text, usage, finish_reason = _call_openai(
+                    api_model=api_model,
+                    prompt=execution_prompt,
+                    images=file_images or None,
+                )
         except Exception as exc:
             return ExecutionResult(
                 status="failed",
@@ -221,7 +259,7 @@ def maybe_execute_routed_answer(
             file_warnings.extend(f"Context budget: {w}" for w in budget_warnings)
 
     metadata: Dict[str, Any] = {
-        "provider": "OpenAI",
+        "provider": provider,
         "routed_model": selected_model,
         "api_model": api_model,
         "finish_reason": finish_reason,
@@ -364,10 +402,11 @@ def _extract_file_contexts(
 
 def _lookup_model_context_window(model_name: str) -> int:
     try:
-        from app.models.registry_builder import MODEL_REGISTRY
+        from app.db.registry_repo import load_registry
+        registry = load_registry()
     except Exception:
         return _DEFAULT_CONTEXT_WINDOW
-    for m in MODEL_REGISTRY:
+    for m in registry:
         if m.get("name") == model_name:
             ctx = m.get("context") or {}
             return int(ctx.get("window") or _DEFAULT_CONTEXT_WINDOW)
@@ -426,6 +465,7 @@ def _flatten_file_context(file_context: List[Dict[str, str]]) -> str:
 def _execute_map_reduce(
     *,
     api_model: str,
+    provider: str,
     user_prompt: str,
     combined_text: str,
     file_images: Optional[List[Dict[str, str]]],
@@ -471,7 +511,12 @@ def _execute_map_reduce(
             f"--- BEGIN PART {i}/{len(chunks)} ---\n{chunk}\n--- END PART {i}/{len(chunks)} ---"
         )
         try:
-            part_text, part_usage, _ = _call_openai(api_model=api_model, prompt=map_prompt)
+            if provider.lower() == "anthropic":
+                part_text, part_usage, _ = _call_anthropic(api_model=api_model, prompt=map_prompt)
+            elif provider.lower() == "meta":
+                part_text, part_usage, _ = _call_meta(api_model=api_model, prompt=map_prompt)
+            else:
+                part_text, part_usage, _ = _call_openai(api_model=api_model, prompt=map_prompt)
         except Exception as exc:
             warnings.append(f"Map call {i}/{len(chunks)} failed: {type(exc).__name__}: {exc}")
             continue
@@ -494,9 +539,18 @@ def _execute_map_reduce(
         + "\n\n".join(intermediates)
     )
     try:
-        final_text, final_usage, finish_reason = _call_openai(
-            api_model=api_model, prompt=reduce_prompt, images=file_images
-        )
+        if provider.lower() == "anthropic":
+            final_text, final_usage, finish_reason = _call_anthropic(
+                api_model=api_model, prompt=reduce_prompt, images=file_images
+            )
+        elif provider.lower() == "meta":
+            final_text, final_usage, finish_reason = _call_meta(
+                api_model=api_model, prompt=reduce_prompt, images=file_images
+            )
+        else:
+            final_text, final_usage, finish_reason = _call_openai(
+                api_model=api_model, prompt=reduce_prompt, images=file_images
+            )
     except Exception as exc:
         warnings.append(f"Reduce call failed: {type(exc).__name__}: {exc}")
         return "", aggregated_usage, None, warnings, stats
@@ -637,6 +691,101 @@ def _call_openai(
     from openai import OpenAI
 
     client = OpenAI()
+    if images:
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for img in images:
+            content.append({"type": "image_url", "image_url": {"url": img["data_url"]}})
+        messages = [{"role": "user", "content": content}]
+    else:
+        messages = [{"role": "user", "content": prompt}]
+
+    completion = client.chat.completions.create(
+        model=api_model,
+        messages=messages,
+    )
+    choice = completion.choices[0]
+    message = choice.message
+    text = (message.content or "").strip()
+
+    usage = {}
+    if getattr(completion, "usage", None) is not None:
+        usage = {
+            "prompt_tokens": getattr(completion.usage, "prompt_tokens", None),
+            "completion_tokens": getattr(completion.usage, "completion_tokens", None),
+            "total_tokens": getattr(completion.usage, "total_tokens", None),
+        }
+
+    return text, usage, getattr(choice, "finish_reason", None)
+
+def _call_anthropic(
+    *,
+    api_model: str,
+    prompt: str,
+    images: Optional[List[Dict[str, str]]] = None,
+) -> tuple[str, Dict[str, Any], Optional[str]]:
+    import anthropic
+
+    client = anthropic.Anthropic()
+    
+    if images:
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for img in images:
+            # Anthropic expects media_type and data
+            try:
+                # Extract media_type and base64 string from data URL
+                # "data:image/jpeg;base64,....."
+                data_url = img["data_url"]
+                prefix, base64_data = data_url.split(",", 1)
+                media_type = prefix.split(":")[1].split(";")[0]
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": base64_data
+                    }
+                })
+            except Exception:
+                continue
+        messages = [{"role": "user", "content": content}]
+    else:
+        messages = [{"role": "user", "content": prompt}]
+
+    response = client.messages.create(
+        model=api_model,
+        max_tokens=2048,
+        messages=messages,
+    )
+    
+    # Extract text from response blocks
+    text = ""
+    for block in response.content:
+        if getattr(block, "type", "") == "text":
+            text += getattr(block, "text", "")
+            
+    usage = {
+        "prompt_tokens": getattr(response.usage, "input_tokens", 0),
+        "completion_tokens": getattr(response.usage, "output_tokens", 0),
+        "total_tokens": getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0),
+    }
+
+    return text.strip(), usage, getattr(response, "stop_reason", None)
+
+def _call_meta(
+    *,
+    api_model: str,
+    prompt: str,
+    images: Optional[List[Dict[str, str]]] = None,
+) -> tuple[str, Dict[str, Any], Optional[str]]:
+    from openai import OpenAI
+
+    # Open-weight models like Llama are usually queried via OpenAI-compatible endpoints.
+    # Defaults to Together AI API format.
+    client = OpenAI(
+        api_key=os.getenv("META_API_KEY", os.getenv("TOGETHER_API_KEY", "")),
+        base_url=os.getenv("META_BASE_URL", "https://api.together.xyz/v1")
+    )
+    
     if images:
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for img in images:

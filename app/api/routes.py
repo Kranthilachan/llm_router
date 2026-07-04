@@ -46,7 +46,7 @@ from app.core.execution import executable_model_names, maybe_execute_routed_answ
 from app.core.formatting import format_decision_summary
 from app.core.llm_domain_parser import hybrid_tiebreaker_parser
 from app.core.router import record_outcome, route
-from app.models.registry_builder import MODEL_REGISTRY
+from app.db.registry_repo import load_registry, update_model_outcome, add_model
 from app.models.schemas import RequestConstraints, TenantContext
 
 router = APIRouter()
@@ -86,12 +86,20 @@ def _apply_execution_constraints(
         return rc, tc
 
     executable_models = executable_model_names()
-    executable_providers = ["OpenAI"]
+    try:
+        from app.db.registry_repo import load_registry
+        registry = load_registry()
+        # Find all unique providers for the executable models
+        executable_providers = list({m["provider"] for m in registry if m["name"] in executable_models})
+    except Exception:
+        executable_providers = ["OpenAI"]
 
     if rc.allowed_providers is None:
         rc.allowed_providers = list(executable_providers)
     else:
-        rc.allowed_providers = [p for p in rc.allowed_providers if p in executable_providers]
+        filtered = [p for p in rc.allowed_providers if p in executable_providers]
+        # If intersection is empty, we must enforce an impossible constraint rather than failing open
+        rc.allowed_providers = filtered if filtered else ["__NONE_FEASIBLE__"]
 
     if tc.allowed_models is None:
         tc.allowed_models = list(executable_models)
@@ -265,7 +273,7 @@ async def route_request(payload: RouteRequest) -> RouteResponse:
                 files=payload.files,
                 profile_name=payload.profile_name,
                 shadow_model=payload.shadow_model,
-                registry=MODEL_REGISTRY,
+                registry=load_registry(),
                 llm_parser=hybrid_tiebreaker_parser if LLM_PARSER_ENABLED else None,
             )
     except ValueError as exc:
@@ -394,7 +402,7 @@ async def route_upload_request(request: Request) -> RouteResponse:
                     files=saved_files,
                     profile_name=profile_name,
                     shadow_model=shadow_model,
-                    registry=MODEL_REGISTRY,
+                    registry=load_registry(),
                     llm_parser=hybrid_tiebreaker_parser if LLM_PARSER_ENABLED else None,
                 )
         except ValueError as exc:
@@ -429,24 +437,33 @@ async def route_upload_request(request: Request) -> RouteResponse:
 @router.post("/outcome", status_code=204)
 async def submit_outcome(payload: OutcomeIn) -> None:
     async with _registry_lock:
-        names = {m["name"] for m in MODEL_REGISTRY}
+        registry = load_registry()
+        names = {m["name"] for m in registry}
         if payload.model_name not in names:
             raise HTTPException(status_code=404, detail=f"Unknown model: {payload.model_name}")
-        record_outcome(
-            registry=MODEL_REGISTRY,
-            model_name=payload.model_name,
-            task_family=payload.task_family,
-            success=payload.success,
-            quality_score=payload.quality_score,
-            latency_ms=payload.latency_ms,
-            cost_usd=payload.cost_usd,
-            user_accepted=payload.user_accepted,
-            safety_flagged=payload.safety_flagged,
-        )
+        
+        # We still update the in-memory copy returned by load_registry() if needed by record_outcome,
+        # but since record_outcome just mutates a local list now, we will replace its call
+        # with a call to update_model_outcome which writes directly to the DB.
+        
+        try:
+            update_model_outcome(
+                model_name=payload.model_name,
+                task_family=payload.task_family,
+                success=payload.success,
+                quality_score=payload.quality_score,
+                latency_ms=payload.latency_ms,
+                cost_usd=payload.cost_usd,
+                user_accepted=payload.user_accepted,
+                safety_flagged=payload.safety_flagged,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/models", response_model=List[ModelSummaryOut])
 async def list_models() -> List[ModelSummaryOut]:
+    registry = load_registry()
     return [
         ModelSummaryOut(
             name=m["name"],
@@ -458,13 +475,26 @@ async def list_models() -> List[ModelSummaryOut]:
             relative_cost_score=m["pricing"]["relative_cost_score"],
             incident_status=m["ops_dynamic"]["incident_status"],
         )
-        for m in MODEL_REGISTRY
+        for m in registry
     ]
 
 
+@router.post("/models", status_code=201)
+async def create_model(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if "name" not in payload:
+        raise HTTPException(status_code=422, detail="Model must have a 'name' field.")
+    
+    async with _registry_lock:
+        try:
+            model_id = add_model(payload)
+            return {"status": "success", "model_id": model_id, "name": payload["name"]}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to insert model: {e}")
+
 @router.get("/models/{name}")
 async def get_model(name: str) -> Dict[str, Any]:
-    for m in MODEL_REGISTRY:
+    registry = load_registry()
+    for m in registry:
         if m["name"] == name:
             return m
     raise HTTPException(status_code=404, detail=f"Unknown model: {name}")

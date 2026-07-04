@@ -201,8 +201,8 @@ def test_allowed_providers_restricts_primary_and_fallbacks():
             "no_feasible_models", "no_models_after_policy", "abstained",
         }
         return
-    from app.models.registry_builder import MODEL_REGISTRY
-    provider_by_name = {m["name"]: m["provider"] for m in MODEL_REGISTRY}
+    from app.db.registry_repo import load_registry
+    provider_by_name = {m["name"]: m["provider"] for m in load_registry()}
     assert provider_by_name[plan.selected_model] == "Anthropic"
     for fb in plan.fallback_models:
         assert provider_by_name[fb] == "Anthropic", (
@@ -223,8 +223,8 @@ def test_openai_only_allowlist_selects_openai_models():
     plan = decision.selected_plan
     if plan is None:
         return
-    from app.models.registry_builder import MODEL_REGISTRY
-    provider_by_name = {m["name"]: m["provider"] for m in MODEL_REGISTRY}
+    from app.db.registry_repo import load_registry
+    provider_by_name = {m["name"]: m["provider"] for m in load_registry()}
     assert provider_by_name[plan.selected_model] == "OpenAI"
     for fb in plan.fallback_models:
         assert provider_by_name[fb] == "OpenAI"

@@ -366,8 +366,8 @@ from app.core.scoring import (
     static_cost_score,
     static_latency_score
 )
+from app.db.registry_repo import load_registry
 from app.core.semantic_parser import parse_task_request
-from app.models.registry_builder import MODEL_REGISTRY
 from app.models.schemas import RequestConstraints, RoutingDecision, TenantContext
 
 
@@ -388,7 +388,8 @@ def route(
     """Main entry point for the ATLAS Router. Returns a complete RoutingDecision."""
     start_time = time.time()
     decision_id = str(uuid.uuid4())
-    registry = registry if registry is not None else MODEL_REGISTRY
+    # Use the DB registry if none was provided
+    registry = registry if registry is not None else load_registry()
 
     # ---- 1-2. Parse the request / build canonical task representation ----
     task = parse_task_request(

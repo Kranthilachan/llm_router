@@ -92,3 +92,6 @@ ATLAS_EMBEDDING_MODEL = os.getenv("ATLAS_EMBEDDING_MODEL", "BAAI/bge-small-en-v1
 # prompt. Requires OPENAI_API_KEY. Set to "" (empty) to disable entirely.
 ATLAS_LLM_PARSER_MODEL = os.getenv("ATLAS_LLM_PARSER_MODEL", "gpt-4o-mini")
 LLM_PARSER_ENABLED = bool(os.getenv("OPENAI_API_KEY")) and bool(ATLAS_LLM_PARSER_MODEL)
+
+# SQLite database path
+ATLAS_DB_PATH = os.getenv("ATLAS_DB_PATH", "data/atlas.db")

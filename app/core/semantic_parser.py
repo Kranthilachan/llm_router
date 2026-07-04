@@ -356,7 +356,21 @@ def parse_task_request(
         if topic in topic_to_domain:
             soft.domain, soft.risk_tier, soft.risk_type, soft.document_type = topic_to_domain[topic]
 
-    complexity = "high" if estimated_tokens > 150000 else "medium" if estimated_tokens > 30000 else "low"
+    # ---- Cognitive vs Size Complexity ----
+    # Token size dictates infrastructure needs (context window)
+    # Task family and ambiguity dictate cognitive depth
+    cognitive_complexity = "low"
+    if soft.primary_family in {"mathematics", "agent", "reasoning"} or soft.decomposition_needed:
+        cognitive_complexity = "high"
+    elif soft.primary_family in {"coding", "translation", "document_qa"} or soft.ambiguity_score > 0.4:
+        cognitive_complexity = "medium"
+
+    if estimated_tokens > 150000 or cognitive_complexity == "high":
+        complexity = "high"
+    elif estimated_tokens > 30000 or cognitive_complexity == "medium":
+        complexity = "medium"
+    else:
+        complexity = "low"
     workflow_profile = infer_workflow_profile(soft.primary_family, soft.domain, input_formats, prompt)
     requires_verifier = (
         hard["requires_verifier"]
