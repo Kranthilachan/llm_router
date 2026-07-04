@@ -7,7 +7,7 @@ ATLAS separates two concerns that most LLM apps mix together:
 1. **Routing** — given a prompt (and optional files), decide the best model based on task type, cost, latency, context window, governance policy, and runtime health.
 2. **Execution** — once the model is picked, actually call it and return the answer. Supports PDFs, text files, images, and audio.
 
-The router is provider-agnostic; execution currently uses OpenAI (`GPT-4o`, `GPT-4o-Mini`, `o3`) and Whisper.
+The router is provider-agnostic; execution currently supports OpenAI, Anthropic, and Meta (via Together AI), alongside OpenAI Whisper for audio extraction.
 
 ---
 
@@ -281,6 +281,7 @@ If the document fits in the model's window, single-shot execution is used (no ch
 | POST | `/outcome` | Report an observed outcome (success, quality, latency, cost) so Bayesian priors update |
 | GET | `/models` | List all models in the canonical registry (summary view) |
 | GET | `/models/{name}` | Full registry entry for one model |
+| POST | `/models` | Dynamically add a new model to the SQLite database without restarting the router |
 | GET | `/versions` | Version stamps for router, parser, policy, scoring, registry, calibration |
 | GET | `/health` | Liveness probe |
 
@@ -333,13 +334,12 @@ atlas_router/
 ├── app/
 │   ├── main.py                        # FastAPI app entrypoint
 │   ├── config.py                       # version stamps + env-var thresholds
-│   ├── models/
-│   │   ├── schemas.py                   # internal dataclasses
-│   │   ├── catalog.py                    # provider -> model name catalog (~95 models)
-│   │   └── registry_builder.py            # builds the canonical MODEL_REGISTRY
+│   ├── db/
+│   │   ├── connection.py                # SQLite database connection pool
+│   │   └── registry_repo.py             # loads and updates models from SQLite
 │   ├── core/
 │   │   ├── artifact_inspection.py          # PDF/image/audio/xlsx/pptx probing
-│   │   ├── semantic_parser.py               # deterministic + heuristic task parsing
+│   │   ├── semantic_parser.py               # deterministic + heuristic (cognitive depth) parsing
 │   │   ├── domain_classifier.py              # fastembed embeddings for domain classification
 │   │   ├── llm_domain_parser.py               # optional GPT-4o-Mini tiebreaker
 │   │   ├── feasibility.py                      # hard constraint filtering
@@ -352,8 +352,11 @@ atlas_router/
 │   └── api/
 │       ├── schemas.py                                  # pydantic request/response models
 │       └── routes.py                                    # FastAPI endpoints
+│   └── models/
+│       └── schemas.py                                  # internal dataclasses
 ├── data/
-│   └── domain_examples.json                              # labeled prompts for domain classifier
+│   ├── atlas.db                                          # canonical SQLite database
+│   └── domain_examples.json                              # legacy labeled prompts (now in DB)
 ├── tests/
 │   └── test_router.py                                     # end-to-end scenario tests
 ├── scripts/
@@ -368,7 +371,11 @@ atlas_router/
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OPENAI_API_KEY` | — | Required for `execute_answer=true`, Whisper transcription, and the LLM domain-parser tiebreaker |
+| `OPENAI_API_KEY` | — | Required for executing OpenAI models, Whisper, and the LLM parser tiebreaker |
+| `ANTHROPIC_API_KEY` | — | Required for executing Anthropic models (e.g., Claude) |
+| `META_API_KEY` | — | Required for executing Meta (Llama) models via an OpenAI-compatible endpoint |
+| `META_BASE_URL` | `https://api.together.xyz/v1` | Base URL for Meta execution |
+| `ATLAS_DB_PATH` | `data/atlas.db` | Path to the SQLite database |
 | `ATLAS_ALLOWED_PROVIDERS` | none | Comma-separated list, e.g. `OpenAI,Anthropic`. Restricts routing to these providers by default. Per-request `allowed_providers` always wins. |
 | `ATLAS_ABSTAIN_THRESHOLD` | `0.40` | Confidence below this → abstain |
 | `ATLAS_ESCALATE_THRESHOLD` | `0.55` | Confidence below this → escalate to human |
@@ -382,11 +389,11 @@ An example file lives at `.env.example`.
 
 ## The model registry
 
-`app/models/registry_builder.py` synthesizes a full canonical registry (modalities, capabilities, pricing, context window, static/dynamic ops telemetry, Bayesian priors, benchmark signals, domain expertise, safety scores, verifier fitness) for every model listed in `app/models/catalog.py`, using deterministic per-model seeding so values are stable across restarts.
+The router uses a **fully dynamic SQLite database** (`data/atlas.db`) as its canonical model registry. 
 
-**This is a synthetic starting point**, not real benchmark data. In production, replace `MODEL_REGISTRY` with a database-backed or config-driven registry hydrated from real telemetry and evaluation pipelines. The rest of the router (feasibility, policy, scoring, planning) only depends on the registry entry *shape*, not on `registry_builder.py` itself.
+This database stores modalities, capabilities, pricing, context windows, static/dynamic ops telemetry, Bayesian priors, benchmark signals, domain expertise, safety scores, and verifier fitness for every model. Because it is backed by SQLite, you can dynamically `POST` new models to the `/models` endpoint and the router will instantly begin factoring them into its Pareto optimization without requiring a restart!
 
-The domain classifier at `app/core/domain_classifier.py` reads labeled prompts from `data/domain_examples.json`. Currently covered domains: `crm`, `hrm`, `project`, `accounts`. Add prompts to any bucket and restart the server — no code changes needed.
+The domain classifier (`app/core/domain_classifier.py`) also reads its labeled prompts dynamically from the `domain_examples` table in the database. Currently covered domains include: `crm`, `hrm`, `project`, `accounts`.
 
 ---
 
